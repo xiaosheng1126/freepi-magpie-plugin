@@ -4,7 +4,8 @@
 // fetches live models dynamically from https://api.freepi.ai/client-version,
 // parses credits multiplier (only 0-rate models show as 免费, others show Nx 积分 like WorkBuddy),
 // displays real-time daily quota & allowance via https://api.freepi.ai/me,
-// and simulates official free-pi CLI headers (x-client-version, stable x-session-id, x-freepi-tool-errors).
+// and enforces strict concurrency: 1 (serialized queue + auto 429 retry) to prevent
+// "free-pi: one request at a time" rate limits when agents (like Codex) trigger parallel requests.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -158,6 +159,17 @@ function toMagpieModel(m) {
   };
 }
 
+// In-process serial queue lock to ensure 100% strict concurrency: 1
+let requestLock = Promise.resolve();
+function withLock(fn) {
+  const prev = requestLock;
+  let release;
+  requestLock = new Promise((resolve) => {
+    release = resolve;
+  });
+  return prev.then(() => fn().finally(release));
+}
+
 export const FreePiAuthPlugin = async ({ client } = {}) => {
   return {
     config: async (cfg) => {
@@ -185,6 +197,7 @@ export const FreePiAuthPlugin = async ({ client } = {}) => {
 
     auth: {
       provider: ID,
+      maxConcurrency: 1, // Tell Magpie Gateway to serialize requests
       methods: [
         {
           type: "oauth",
@@ -297,39 +310,55 @@ export const FreePiAuthPlugin = async ({ client } = {}) => {
           apiKey: token,
           // Custom simulated fetch replicating official free-pi CLI headers & session auto-recovery
           async fetch(input, init = {}) {
-            const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-            const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
+            return withLock(async () => {
+              const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+              const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
 
-            headers.set("Authorization", `Bearer ${token}`);
-            headers.set("Content-Type", "application/json");
-            headers.set("x-client-version", cliVersion);
-            if (!headers.has("x-session-id")) {
-              headers.set("x-session-id", stableSessionId);
-            }
-            headers.set("x-freepi-tool-errors", "v1:");
+              headers.set("Authorization", `Bearer ${token}`);
+              headers.set("Content-Type", "application/json");
+              headers.set("x-client-version", cliVersion);
+              if (!headers.has("x-session-id")) {
+                headers.set("x-session-id", stableSessionId);
+              }
+              headers.set("x-freepi-tool-errors", "v1:");
 
-            let res = await globalThis.fetch(url, {
-              ...init,
-              headers
-            });
+              let res = await globalThis.fetch(url, {
+                ...init,
+                headers
+              });
 
-            // Auto-heal concurrent_session (409) if an earlier session crashed
-            if (res.status === 409) {
-              try {
-                const resetRes = await globalThis.fetch(`${API_ROOT}/session/reset`, {
-                  method: "POST",
-                  headers: { Authorization: `Bearer ${token}` }
-                });
-                if (resetRes.ok) {
+              // 1. Auto-heal concurrent_session (409) if an earlier session crashed
+              if (res.status === 409) {
+                try {
+                  const resetRes = await globalThis.fetch(`${API_ROOT}/session/reset`, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${token}` }
+                  });
+                  if (resetRes.ok) {
+                    await new Promise((r) => setTimeout(r, 1000));
+                    res = await globalThis.fetch(url, {
+                      ...init,
+                      headers
+                    });
+                  }
+                } catch {}
+              }
+
+              // 2. Auto-heal rate limit (429: "one request at a time") with small wait & retry
+              if (res.status === 429) {
+                const clone = res.clone();
+                const errText = await clone.text().catch(() => "");
+                if (errText.includes("one request at a time") || errText.includes("concurrent")) {
+                  await new Promise((r) => setTimeout(r, 2000));
                   res = await globalThis.fetch(url, {
                     ...init,
                     headers
                   });
                 }
-              } catch {}
-            }
+              }
 
-            return res;
+              return res;
+            });
           }
         };
       }
