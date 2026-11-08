@@ -2,12 +2,11 @@
 //
 // Automatically reuses the local login state from `~/.free-pi/agent/credentials.json`,
 // fetches live models dynamically from https://api.freepi.ai/client-version,
-// exposes real-time daily quota & allowance via https://api.freepi.ai/me,
-// and marks all models as free (0 cost) in Magpie.
-// Requests are simulated with official free-pi CLI headers (x-client-version,
-// x-session-id, x-freepi-tool-errors) to ensure seamless continuity and safety.
+// parses credits multiplier (only 0-rate models show as 免费, others show Nx 积分 like WorkBuddy),
+// displays real-time daily quota & allowance via https://api.freepi.ai/me,
+// and simulates official free-pi CLI headers (x-client-version, stable x-session-id, x-freepi-tool-errors).
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -18,22 +17,41 @@ const API_ROOT = "https://api.freepi.ai";
 
 // Default fallback models in case network is down during initial registration
 const BOOTSTRAP_MODELS = [
-  { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash · Free" },
-  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash · Free" },
-  { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro · Free" },
-  { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5 · Free" },
-  { id: "claude-haiku-5.5", name: "Claude Haiku 5.5 · Free" },
-  { id: "gpt-6.1-terra", name: "GPT-6.1 Terra · Free" },
-  { id: "gpt-6.1-sol", name: "GPT-6.1 Sol · Free" },
-  { id: "gpt-6-luna", name: "GPT-6 Luna · Free" },
-  { id: "glm-5.3-flash", name: "GLM 5.3 Flash · Free" },
-  { id: "kimi-k3.1-pro", name: "Kimi K3.1 Pro · Free" },
-  { id: "gemini-4-argon", name: "Gemini 4 Argon · Free" },
-  { id: "particle", name: "Particle · Free" }
+  { id: "particle", name: "Particle · 🔥 Free Unlimited: limited time" },
+  { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash · 🔥 Free Unlimited: limited time" },
+  { id: "glm-5.3-flash", name: "GLM 5.3 Flash · 🔥 Free Unlimited: limited time" },
+  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash · 🔥 Free Unlimited: limited time" },
+  { id: "claude-haiku-5.5", name: "Claude Haiku 5.5 · ~2.0x usage" },
+  { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5 · unavailable", unavailable: true },
+  { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro · ~18x usage" },
+  { id: "gpt-6.1-terra", name: "GPT-6.1 Terra · ~20x usage" },
+  { id: "gpt-6.1-sol", name: "GPT-6.1 Sol · unavailable", unavailable: true },
+  { id: "gpt-6-luna", name: "GPT-6 Luna · ~2.0x usage" },
+  { id: "kimi-k3.1-pro", name: "Kimi K3.1 Pro · ~41x usage" },
+  { id: "solar-pro-4", name: "Solar Pro 4 · ~0.6x usage" }
 ];
 
 function getCredentialsPath() {
   return join(homedir(), ".free-pi", "agent", "credentials.json");
+}
+
+function getSessionIdPath() {
+  return join(homedir(), ".free-pi", "agent", "magpie-session-id");
+}
+
+function getStableSessionId() {
+  const p = getSessionIdPath();
+  if (existsSync(p)) {
+    try {
+      const s = readFileSync(p, "utf8").trim();
+      if (s) return s;
+    } catch {}
+  }
+  const id = randomUUID();
+  try {
+    writeFileSync(p, id, "utf8");
+  } catch {}
+  return id;
 }
 
 function readToken() {
@@ -100,17 +118,37 @@ async function fetchLiveModels(token, fetchImpl = globalThis.fetch) {
   return null;
 }
 
+function parseModelPricing(rawName, unavailable) {
+  if (unavailable || /unavailable/i.test(rawName)) {
+    return { isFree: false, rate: 0, tag: "不可用" };
+  }
+  // Free models explicitly say "Free Unlimited" in name
+  const isFree = /free\s+unlimited/i.test(rawName);
+  if (isFree) {
+    return { isFree: true, rate: 0, tag: "免费" };
+  }
+  // Otherwise parse the multiplier e.g. "~20x usage" -> 20
+  const rateMatch = rawName.match(/~([0-9.]+)x/i);
+  const rate = rateMatch ? parseFloat(rateMatch[1]) : 1;
+  return { isFree: false, rate, tag: `${rate}x 积分` };
+}
+
 function toMagpieModel(m) {
   const id = m.id;
-  const name = m.name || id;
+  const rawName = m.name || id;
+  const baseName = rawName.split(" · ")[0].trim();
+  const pricing = parseModelPricing(rawName, m.unavailable);
+  const displayName = `${baseName} · ${pricing.tag}`;
+
   return {
     id,
-    name,
-    free: true,
+    name: displayName,
+    free: pricing.isFree,
+    rate: pricing.rate,
     limit: { context: 131072, output: 8192 },
     reasoning: true,
     tool_call: true,
-    cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    cost: pricing.isFree ? { input: 0, output: 0, cache_read: 0, cache_write: 0 } : undefined,
     capabilities: {
       reasoning: true,
       toolcall: true,
@@ -252,12 +290,12 @@ export const FreePiAuthPlugin = async ({ client } = {}) => {
         if (!token) return {};
 
         const cliVersion = getCliVersion();
-        let currentSessionId = randomUUID();
+        const stableSessionId = getStableSessionId();
 
         return {
           baseURL: BASE,
           apiKey: token,
-          // Custom simulated fetch replicating official free-pi CLI headers
+          // Custom simulated fetch replicating official free-pi CLI headers & session auto-recovery
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
             const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
@@ -266,14 +304,32 @@ export const FreePiAuthPlugin = async ({ client } = {}) => {
             headers.set("Content-Type", "application/json");
             headers.set("x-client-version", cliVersion);
             if (!headers.has("x-session-id")) {
-              headers.set("x-session-id", currentSessionId);
+              headers.set("x-session-id", stableSessionId);
             }
             headers.set("x-freepi-tool-errors", "v1:");
 
-            return globalThis.fetch(url, {
+            let res = await globalThis.fetch(url, {
               ...init,
               headers
             });
+
+            // Auto-heal concurrent_session (409) if an earlier session crashed
+            if (res.status === 409) {
+              try {
+                const resetRes = await globalThis.fetch(`${API_ROOT}/session/reset`, {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${token}` }
+                });
+                if (resetRes.ok) {
+                  res = await globalThis.fetch(url, {
+                    ...init,
+                    headers
+                  });
+                }
+              } catch {}
+            }
+
+            return res;
           }
         };
       }
