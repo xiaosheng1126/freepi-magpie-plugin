@@ -1,0 +1,23 @@
+{
+  "name": "opencode-freepi-auth",
+  "version": "0.1.0",
+  "description": "OpenCode & Magpie provider plugin for free-pi CLI AI models, reusing local free-pi CLI auth, supporting live quota meter and free LLM status",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "free-pi",
+    "freepi"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "maxConcurrency": 2
+  }
+}
